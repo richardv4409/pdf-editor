@@ -18,6 +18,14 @@ import hashlib
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+from docx import Document as DocxDocument
+from docx.shared import Inches, Pt, RGBColor, Twips
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
+import pymupdf4llm
+import re
 
 
 class PasswordSetupDialog(tk.Toplevel):
@@ -1077,6 +1085,7 @@ class CompletePDFEditor:
         self.current_page_num: int = 0
         self.total_pages: int = 0
         self.pdf_path: Optional[str] = None
+        self.pdf_is_encrypted: bool = False
 
         # Display state
         self.zoom_level: float = 1.0
@@ -1132,6 +1141,10 @@ class CompletePDFEditor:
         file_menu.add_command(label="Save (Ctrl+S)", command=self.save_pdf,
                             accelerator="Ctrl+S")
         file_menu.add_command(label="Save As...", command=self.save_pdf_as)
+        file_menu.add_separator()
+        file_menu.add_command(label="Remove Password Protection", command=self.remove_password_protection)
+        file_menu.add_command(label="Bulk Remove Passwords...", command=self.bulk_remove_passwords)
+        file_menu.add_command(label="Convert to Word (.docx)", command=self.convert_to_word)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.root.quit)
 
@@ -1341,6 +1354,22 @@ class CompletePDFEditor:
                   command=self.reset_rotation).pack(fill=tk.X, pady=2)
         self.rotation_label = ttk.Label(rotation_frame, text="0°")
         self.rotation_label.pack(pady=5)
+
+        # Security
+        security_frame = ttk.LabelFrame(scrollable_frame, text="Security", padding="10")
+        security_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        ttk.Button(security_frame, text="🔓 Remove Password Protection",
+                  command=self.remove_password_protection).pack(fill=tk.X, pady=2)
+        ttk.Button(security_frame, text="🔓 Bulk Remove Passwords",
+                  command=self.bulk_remove_passwords).pack(fill=tk.X, pady=2)
+
+        # Export
+        export_frame = ttk.LabelFrame(scrollable_frame, text="Export", padding="10")
+        export_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        ttk.Button(export_frame, text="📄 Convert to Word (.docx)",
+                  command=self.convert_to_word).pack(fill=tk.X, pady=2)
 
         # Center panel - PDF viewer
         center_panel = ttk.Frame(main_container)
@@ -1592,6 +1621,50 @@ class CompletePDFEditor:
 
         self.manage_signatures()
 
+    def _ask_pdf_password(self, filename: str) -> Optional[str]:
+        """Show a password dialog pre-populated with default ID for encrypted PDFs"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Password Required")
+        dialog.geometry("400x200")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        result = {"password": None}
+
+        ttk.Label(dialog, text="PDF is password protected.",
+                 font=('Arial', 11, 'bold')).pack(pady=(15, 5))
+        ttk.Label(dialog, text=f"Enter password to open:\n{filename}",
+                 justify=tk.CENTER).pack(pady=(0, 10))
+
+        entry_frame = ttk.Frame(dialog, padding="10")
+        entry_frame.pack(fill=tk.X)
+
+        ttk.Label(entry_frame, text="Password:").pack(anchor=tk.W)
+        password_entry = ttk.Entry(entry_frame, show="*", width=40)
+        password_entry.pack(fill=tk.X, pady=5)
+        password_entry.insert(0, "7004295198084")
+        password_entry.select_range(0, tk.END)
+
+        def on_ok():
+            result["password"] = password_entry.get()
+            dialog.destroy()
+
+        def on_cancel():
+            dialog.destroy()
+
+        password_entry.bind('<Return>', lambda e: on_ok())
+        password_entry.bind('<Escape>', lambda e: on_cancel())
+
+        btn_frame = ttk.Frame(dialog, padding="10")
+        btn_frame.pack(fill=tk.X)
+        ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_frame, text="OK", command=on_ok).pack(side=tk.RIGHT)
+
+        password_entry.focus()
+        dialog.wait_window()
+        return result["password"]
+
     def open_pdf(self):
         """Open PDF file"""
         file_path = filedialog.askopenfilename(
@@ -1606,7 +1679,34 @@ class CompletePDFEditor:
             if self.pdf_document:
                 self.pdf_document.close()
 
-            self.pdf_document = fitz.open(file_path)
+            # Try to open the PDF
+            doc = fitz.open(file_path)
+
+            # Check if PDF is encrypted/password protected
+            if doc.is_encrypted:
+                self.pdf_is_encrypted = True
+
+                # Try to authenticate (some PDFs may have empty password)
+                if not doc.authenticate(""):
+                    # Need password from user - pre-populate with default ID
+                    password = self._ask_pdf_password(os.path.basename(file_path))
+
+                    if password is None:
+                        # User cancelled
+                        doc.close()
+                        return
+
+                    if not doc.authenticate(password):
+                        messagebox.showerror("Error", "Incorrect password!\nCould not open PDF.")
+                        doc.close()
+                        return
+
+                    messagebox.showinfo("Success", "Password accepted! PDF unlocked.")
+            else:
+                self.pdf_is_encrypted = False
+
+            # PDF opened successfully
+            self.pdf_document = doc
             self.pdf_path = file_path
             self.total_pages = len(self.pdf_document)
             self.current_page_num = 0
@@ -1617,8 +1717,10 @@ class CompletePDFEditor:
             self.page_rotations = {}  # Clear rotations for new PDF
 
             self.display_current_page()
-            self.update_status(f"Opened: {os.path.basename(file_path)} ({self.total_pages} pages)")
-            messagebox.showinfo("Success", f"PDF loaded!\n{self.total_pages} pages")
+
+            enc_status = " (Encrypted)" if self.pdf_is_encrypted else ""
+            self.update_status(f"Opened: {os.path.basename(file_path)} ({self.total_pages} pages){enc_status}")
+            messagebox.showinfo("Success", f"PDF loaded!\n{self.total_pages} pages{enc_status}")
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to open PDF:\n{str(e)}")
@@ -2015,6 +2117,467 @@ class CompletePDFEditor:
                 messagebox.showinfo("Success", "PDF saved!")
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to save:\n{str(e)}")
+
+    def remove_password_protection(self):
+        """Remove password protection from PDF and save without encryption"""
+        if not self.pdf_document:
+            messagebox.showwarning("No PDF", "Please open a PDF first.")
+            return
+
+        # Check if PDF is encrypted
+        if not self.pdf_is_encrypted:
+            messagebox.showinfo("Not Encrypted",
+                              "This PDF is not password protected.\n"
+                              "No action needed.")
+            return
+
+        # Build output path: same folder, same name with _unprotected suffix
+        base, ext = os.path.splitext(self.pdf_path)
+        output_path = f"{base}_unprotected{ext}"
+
+        try:
+            # Apply any pending annotations
+            self.apply_annotations()
+
+            # Save without encryption
+            self.pdf_document.save(output_path, encryption=fitz.PDF_ENCRYPT_NONE)
+
+            messagebox.showinfo("Success",
+                              f"Password protection removed!\n\n"
+                              f"Saved as:\n{os.path.basename(output_path)}")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to remove password protection:\n{str(e)}")
+
+    def bulk_remove_passwords(self):
+        """Remove password protection from multiple PDF files at once"""
+        file_paths = filedialog.askopenfilenames(
+            title="Select Password-Protected PDFs",
+            filetypes=[("PDF Files", "*.pdf"), ("All Files", "*.*")]
+        )
+
+        if not file_paths:
+            return
+
+        # Ask for password once using the same pre-populated dialog
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Bulk Password Removal")
+        dialog.geometry("400x200")
+        dialog.resizable(False, False)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        result = {"password": None}
+
+        ttk.Label(dialog, text=f"Unlock {len(file_paths)} PDF file(s)",
+                 font=('Arial', 11, 'bold')).pack(pady=(15, 5))
+        ttk.Label(dialog, text="Enter the shared password for all selected files:",
+                 justify=tk.CENTER).pack(pady=(0, 10))
+
+        entry_frame = ttk.Frame(dialog, padding="10")
+        entry_frame.pack(fill=tk.X)
+
+        ttk.Label(entry_frame, text="Password:").pack(anchor=tk.W)
+        password_entry = ttk.Entry(entry_frame, show="*", width=40)
+        password_entry.pack(fill=tk.X, pady=5)
+        password_entry.insert(0, "7004295198084")
+        password_entry.select_range(0, tk.END)
+
+        def on_ok():
+            result["password"] = password_entry.get()
+            dialog.destroy()
+
+        def on_cancel():
+            dialog.destroy()
+
+        password_entry.bind('<Return>', lambda e: on_ok())
+        password_entry.bind('<Escape>', lambda e: on_cancel())
+
+        btn_frame = ttk.Frame(dialog, padding="10")
+        btn_frame.pack(fill=tk.X)
+        ttk.Button(btn_frame, text="Cancel", command=on_cancel).pack(side=tk.RIGHT, padx=5)
+        ttk.Button(btn_frame, text="OK", command=on_ok).pack(side=tk.RIGHT)
+
+        password_entry.focus()
+        dialog.wait_window()
+
+        password = result["password"]
+        if password is None:
+            return
+
+        # Process each file
+        succeeded = []
+        failed = []
+
+        for file_path in file_paths:
+            try:
+                doc = fitz.open(file_path)
+
+                if not doc.is_encrypted:
+                    # Not encrypted - skip
+                    failed.append((os.path.basename(file_path), "Not password protected"))
+                    doc.close()
+                    continue
+
+                # Try empty password first, then provided password
+                if not doc.authenticate("") and not doc.authenticate(password):
+                    failed.append((os.path.basename(file_path), "Incorrect password"))
+                    doc.close()
+                    continue
+
+                # Save unprotected version
+                base, ext = os.path.splitext(file_path)
+                output_path = f"{base}_unprotected{ext}"
+                doc.save(output_path, encryption=fitz.PDF_ENCRYPT_NONE)
+                doc.close()
+                succeeded.append(os.path.basename(output_path))
+
+            except Exception as e:
+                failed.append((os.path.basename(file_path), str(e)))
+
+        # Show summary
+        msg = f"Processed {len(file_paths)} file(s).\n\n"
+        if succeeded:
+            msg += f"Saved {len(succeeded)} unprotected file(s):\n"
+            for name in succeeded:
+                msg += f"  - {name}\n"
+        if failed:
+            msg += f"\n{len(failed)} file(s) failed:\n"
+            for name, reason in failed:
+                msg += f"  - {name}: {reason}\n"
+
+        messagebox.showinfo("Bulk Password Removal", msg)
+
+    def convert_to_word(self):
+        """Convert PDF to Word document (.docx) using pymupdf4llm for layout analysis"""
+        if not self.pdf_document:
+            messagebox.showwarning("No PDF", "Please open a PDF first.")
+            return
+
+        # Ask where to save the Word document
+        output_path = filedialog.asksaveasfilename(
+            title="Save Word Document As",
+            defaultextension=".docx",
+            filetypes=[("Word Documents", "*.docx")],
+            initialfile=os.path.basename(self.pdf_path).replace(".pdf", ".docx") if self.pdf_path else "document.docx"
+        )
+
+        if not output_path:
+            return
+
+        try:
+            self.update_status("Analyzing PDF layout... Please wait.")
+            self.root.update_idletasks()
+
+            # Use pymupdf4llm for layout-aware extraction
+            # This provides much better text extraction with proper layout analysis
+            md_text = pymupdf4llm.to_markdown(
+                self.pdf_path,
+                page_chunks=True,  # Get per-page chunks
+                write_images=False,  # We'll handle images separately
+                show_progress=False
+            )
+
+            self.update_status("Creating Word document...")
+            self.root.update_idletasks()
+
+            # Create a new Word document
+            doc = DocxDocument()
+
+            total_pages = len(self.pdf_document)
+
+            # Process each page
+            if isinstance(md_text, list):
+                # Page chunks mode
+                for page_num, page_data in enumerate(md_text):
+                    self.update_status(f"Converting page {page_num + 1} of {total_pages}...")
+                    self.root.update_idletasks()
+
+                    # Get the markdown content for this page
+                    if isinstance(page_data, dict):
+                        page_md = page_data.get('text', '')
+                    else:
+                        page_md = str(page_data)
+
+                    # Convert markdown to Word content
+                    self._markdown_to_word(doc, page_md, page_num)
+
+                    # Extract images for this page
+                    if page_num < len(self.pdf_document):
+                        self._extract_images_from_page(doc, self.pdf_document[page_num])
+
+                    # Add page break (except for last page)
+                    if page_num < total_pages - 1:
+                        doc.add_page_break()
+            else:
+                # Single text mode - process entire document
+                self._markdown_to_word(doc, str(md_text), 0)
+
+                # Extract all images
+                for page_num in range(total_pages):
+                    self._extract_images_from_page(doc, self.pdf_document[page_num])
+
+            # Save the document
+            doc.save(output_path)
+
+            self.update_status(f"Converted: {os.path.basename(output_path)}")
+            messagebox.showinfo("Success",
+                              f"PDF converted to Word successfully!\n\n"
+                              f"Saved as:\n{os.path.basename(output_path)}\n\n"
+                              f"Pages converted: {total_pages}")
+
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to convert PDF to Word:\n{str(e)}")
+            self.update_status("Conversion failed")
+
+    def _markdown_to_word(self, doc, markdown_text: str, page_num: int):
+        """Convert markdown text to Word document content with proper formatting"""
+
+        lines = markdown_text.split('\n')
+        in_table = False
+        table_rows = []
+        in_code_block = False
+        code_lines = []
+
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+
+            # Handle code blocks
+            if line.strip().startswith('```'):
+                if in_code_block:
+                    # End code block
+                    if code_lines:
+                        para = doc.add_paragraph()
+                        para.style = 'No Spacing'
+                        for code_line in code_lines:
+                            run = para.add_run(code_line + '\n')
+                            run.font.name = 'Courier New'
+                            run.font.size = Pt(9)
+                        code_lines = []
+                    in_code_block = False
+                else:
+                    in_code_block = True
+                i += 1
+                continue
+
+            if in_code_block:
+                code_lines.append(line)
+                i += 1
+                continue
+
+            # Handle tables (markdown format: | cell | cell |)
+            if '|' in line and line.strip().startswith('|'):
+                if not in_table:
+                    in_table = True
+                    table_rows = []
+
+                # Skip separator lines (|---|---|)
+                if re.match(r'^\s*\|[\s\-:|\+]+\|\s*$', line):
+                    i += 1
+                    continue
+
+                # Parse table row
+                cells = [cell.strip() for cell in line.split('|')[1:-1]]
+                if cells:
+                    table_rows.append(cells)
+                i += 1
+                continue
+            elif in_table:
+                # End of table - create Word table
+                self._create_word_table(doc, table_rows)
+                in_table = False
+                table_rows = []
+                # Don't increment i, process current line normally
+
+            # Handle headings
+            if line.startswith('######'):
+                para = doc.add_paragraph(line[6:].strip())
+                para.style = 'Heading 6' if 'Heading 6' in [s.name for s in doc.styles] else 'Heading 3'
+                i += 1
+                continue
+            elif line.startswith('#####'):
+                para = doc.add_paragraph(line[5:].strip())
+                para.style = 'Heading 5' if 'Heading 5' in [s.name for s in doc.styles] else 'Heading 3'
+                i += 1
+                continue
+            elif line.startswith('####'):
+                para = doc.add_paragraph(line[4:].strip())
+                para.style = 'Heading 4' if 'Heading 4' in [s.name for s in doc.styles] else 'Heading 3'
+                i += 1
+                continue
+            elif line.startswith('###'):
+                para = doc.add_paragraph(line[3:].strip())
+                para.style = 'Heading 3'
+                i += 1
+                continue
+            elif line.startswith('##'):
+                para = doc.add_paragraph(line[2:].strip())
+                para.style = 'Heading 2'
+                i += 1
+                continue
+            elif line.startswith('#'):
+                para = doc.add_paragraph(line[1:].strip())
+                para.style = 'Heading 1'
+                i += 1
+                continue
+
+            # Handle bullet points
+            bullet_match = re.match(r'^(\s*)[\*\-\+]\s+(.+)$', line)
+            if bullet_match:
+                text = bullet_match.group(2)
+                para = doc.add_paragraph(style='List Bullet')
+                self._add_formatted_text(para, text)
+                i += 1
+                continue
+
+            # Handle numbered lists
+            num_match = re.match(r'^(\s*)(\d+)\.\s+(.+)$', line)
+            if num_match:
+                text = num_match.group(3)
+                para = doc.add_paragraph(style='List Number')
+                self._add_formatted_text(para, text)
+                i += 1
+                continue
+
+            # Handle horizontal rules
+            if re.match(r'^[\-\*_]{3,}\s*$', line.strip()):
+                para = doc.add_paragraph('_' * 50)
+                para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                i += 1
+                continue
+
+            # Skip empty lines
+            if not line.strip():
+                i += 1
+                continue
+
+            # Regular text - add as paragraph
+            para = doc.add_paragraph()
+            self._add_formatted_text(para, line.strip())
+            i += 1
+
+        # Handle any remaining table
+        if in_table and table_rows:
+            self._create_word_table(doc, table_rows)
+
+    def _add_formatted_text(self, paragraph, text: str):
+        """Add text to paragraph with markdown formatting (bold, italic, etc.)"""
+        if not text:
+            return
+        text = text.strip()
+
+        # Pattern to match **bold**, *italic*, ***bold italic***, `code`
+        pattern = r'(\*\*\*(.+?)\*\*\*|\*\*(.+?)\*\*|\*(.+?)\*|`(.+?)`|__(.+?)__|_(.+?)_)'
+
+        last_end = 0
+        for match in re.finditer(pattern, text):
+            # Add text before this match
+            if match.start() > last_end:
+                paragraph.add_run(text[last_end:match.start()])
+
+            # Determine formatting
+            full_match = match.group(0)
+            if full_match.startswith('***') or full_match.startswith('___'):
+                # Bold italic
+                content = match.group(2) or match.group(0)[3:-3]
+                run = paragraph.add_run(content)
+                run.bold = True
+                run.italic = True
+            elif full_match.startswith('**') or full_match.startswith('__'):
+                # Bold
+                content = match.group(3) or match.group(6) or full_match[2:-2]
+                run = paragraph.add_run(content)
+                run.bold = True
+            elif full_match.startswith('*') or full_match.startswith('_'):
+                # Italic
+                content = match.group(4) or match.group(7) or full_match[1:-1]
+                run = paragraph.add_run(content)
+                run.italic = True
+            elif full_match.startswith('`'):
+                # Code
+                content = match.group(5) or full_match[1:-1]
+                run = paragraph.add_run(content)
+                run.font.name = 'Courier New'
+                run.font.size = Pt(9)
+
+            last_end = match.end()
+
+        # Add remaining text
+        if last_end < len(text):
+            paragraph.add_run(text[last_end:])
+
+    def _create_word_table(self, doc, table_rows: list):
+        """Create a Word table from parsed markdown table rows"""
+        if not table_rows:
+            return
+
+        num_rows = len(table_rows)
+        num_cols = max(len(row) for row in table_rows)
+
+        if num_cols == 0:
+            return
+
+        # Create table
+        table = doc.add_table(rows=num_rows, cols=num_cols)
+        table.style = 'Table Grid'
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+
+        # Fill cells
+        for row_idx, row_data in enumerate(table_rows):
+            for col_idx, cell_text in enumerate(row_data):
+                if col_idx < num_cols:
+                    cell = table.cell(row_idx, col_idx)
+                    # Clear default paragraph
+                    cell.text = ""
+                    para = cell.paragraphs[0]
+                    self._add_formatted_text(para, str(cell_text) if cell_text else "")
+
+                    # Make first row bold (header)
+                    if row_idx == 0:
+                        for run in para.runs:
+                            run.bold = True
+
+        # Add spacing after table
+        doc.add_paragraph()
+
+    def _extract_images_from_page(self, doc, page):
+        """Extract images from PDF page and add to Word document"""
+        try:
+            image_list = page.get_images(full=True)
+            for img_info in image_list:
+                try:
+                    xref = img_info[0]
+                    base_image = self.pdf_document.extract_image(xref)
+                    image_bytes = base_image["image"]
+
+                    # Open and process image
+                    img = Image.open(io.BytesIO(image_bytes))
+
+                    # Skip very small images (likely artifacts)
+                    if img.width < 50 or img.height < 50:
+                        continue
+
+                    # Convert to RGB if necessary
+                    if img.mode in ('RGBA', 'P'):
+                        img = img.convert('RGB')
+
+                    # Save to bytes
+                    img_buffer = io.BytesIO()
+                    img.save(img_buffer, format='PNG')
+                    img_buffer.seek(0)
+
+                    # Calculate appropriate width (max 6 inches)
+                    max_width = 6
+                    img_width_inches = min(img.width / 96, max_width)
+
+                    # Add image to document
+                    doc.add_picture(img_buffer, width=Inches(img_width_inches))
+
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def apply_annotations(self):
         """Apply annotations and rotations to PDF"""
