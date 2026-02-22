@@ -2142,9 +2142,7 @@ class CompletePDFEditor:
             # Save without encryption
             self.pdf_document.save(output_path, encryption=fitz.PDF_ENCRYPT_NONE)
 
-            messagebox.showinfo("Success",
-                              f"Password protection removed!\n\n"
-                              f"Saved as:\n{os.path.basename(output_path)}")
+            self.update_status(f"Password removed — saved as: {os.path.basename(output_path)}")
 
         except Exception as e:
             messagebox.showerror("Error", f"Failed to remove password protection:\n{str(e)}")
@@ -2236,17 +2234,14 @@ class CompletePDFEditor:
                 failed.append((os.path.basename(file_path), str(e)))
 
         # Show summary
-        msg = f"Processed {len(file_paths)} file(s).\n\n"
-        if succeeded:
-            msg += f"Saved {len(succeeded)} unprotected file(s):\n"
-            for name in succeeded:
-                msg += f"  - {name}\n"
         if failed:
-            msg += f"\n{len(failed)} file(s) failed:\n"
+            msg = f"Processed {len(file_paths)} file(s). {len(succeeded)} succeeded.\n\n"
+            msg += "Failed:\n"
             for name, reason in failed:
                 msg += f"  - {name}: {reason}\n"
-
-        messagebox.showinfo("Bulk Password Removal", msg)
+            messagebox.showwarning("Bulk Password Removal", msg)
+        else:
+            self.update_status(f"Bulk password removal complete — {len(succeeded)} file(s) saved")
 
     def convert_to_word(self):
         """Convert PDF to Word document (.docx) using pymupdf4llm for layout analysis"""
